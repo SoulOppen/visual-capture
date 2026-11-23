@@ -1,4 +1,4 @@
-"""Command line entry point for the reusable image downloader."""
+"""Command line entry point for the screenshot downloader."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ DEFAULT_OUTPUT = TOOL_ROOT.parent / "visual-check-screenshots"
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download screenshots of any set of URLs, or of every Laravel GET route."
+        description="Download full-page screenshots of any set of URLs, or of every Laravel GET route."
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Site origin used for relative routes")
     parser.add_argument(
@@ -58,8 +58,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip", help="Regex: exclude matching route paths")
     parser.add_argument("--timeout", type=int, default=90_000, help="Per-navigation timeout in ms")
     parser.add_argument("--settle-ms", type=int, default=800, help="Wait after load/fonts before screenshot")
-    parser.add_argument("--download-only", action="store_true", help="Just save PNGs, skip pixel/color analysis")
-    parser.add_argument("--strict", action="store_true", help="Exit 1 on errors, overflow or low brand color")
     return parser.parse_args(argv)
 
 
@@ -116,16 +114,13 @@ def main(argv: list[str] | None = None) -> int:
     for directory in viewport_dirs.values():
         directory.mkdir(parents=True, exist_ok=True)
 
-    console_errors: list[str] = []
-    page_errors: list[str] = []
     captures: list[dict] = []
+    values: dict[str, str] = {}
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page(viewport={"width": VIEWPORTS[viewports[0]][0], "height": VIEWPORTS[viewports[0]][1]})
         page.set_default_navigation_timeout(args.timeout)
-        page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
-        page.on("pageerror", lambda err: page_errors.append(str(err)))
 
         try:
             if bool(args.email) != bool(args.password):
@@ -138,7 +133,6 @@ def main(argv: list[str] | None = None) -> int:
                 page.locator(args.submit_selector).click()
                 page.wait_for_url(args.success_url, timeout=args.timeout)
 
-            values = {}
             if laravel_mode:
                 values = discover_values(page, args.base_url, args.timeout, ready_js)
             selected, skipped = select_routes(routes, values, args.only, args.skip)
@@ -149,85 +143,50 @@ def main(argv: list[str] | None = None) -> int:
                 for viewport in viewports:
                     result = capture_route(
                         page, target, viewport, viewport_dirs[viewport], args.timeout,
-                        console_errors, page_errors, ready_js, args.download_only,
-                        args.settle_ms, filename_token(route.uri),
+                        ready_js, args.settle_ms, filename_token(route.uri),
                     )
                     captures.append(asdict(result))
-                    print(
-                        f"{result.status or '---'} {viewport:<16} {target:<48} "
-                        f"brand={result.brand_ratio if not args.download_only else 'skip'} overflow={result.overflow_px}"
-                    )
+                    state = result.error or f"status={result.status or '---'}"
+                    print(f"{viewport:<16} {target:<48} {state}")
         finally:
             browser.close()
 
-    # Compare each viewport against the home page at that same viewport; a single
-    # global baseline makes narrow screens look falsely worse than wide ones.
-    baselines: dict[str, float] = {}
-    if not args.download_only:
-        home = args.base_url.rstrip("/") + "/"
-        baselines = {c["viewport"]: c["brand_ratio"] for c in captures if c["route"] == home}
-    for capture in captures:
-        reference = baselines.get(capture["viewport"])
-        threshold = reference * 0.30 if reference else None
-        capture["low_brand"] = bool(threshold and capture["brand_ratio"] < threshold)
-
-    report = {
+    failures = [c for c in captures if c["error"] or not c["screenshot"]]
+    manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "base_url": args.base_url,
-        "mode": "download" if args.download_only else "audit",
         "viewports": viewports,
         "sample_values": values,
-        "baseline_brand_ratio": baselines or None,
-        "low_brand_threshold": {v: round(b * 0.30, 4) for v, b in baselines.items()},
         "routes_rendered": len(selected),
         "routes_skipped": [asdict(s) for s in skipped],
+        "files_downloaded": len(captures) - len(failures),
+        "failures": len(failures),
         "captures": captures,
-        "issues": {
-            "console_errors": sum(len(c["console_errors"]) for c in captures),
-            "page_errors": sum(len(c["page_errors"]) for c in captures),
-            "overflow": sum(1 for c in captures if c["overflow_px"] > 0),
-            "low_brand": sum(1 for c in captures if c["low_brand"]),
-        },
     }
-    (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    write_markdown(output / "report.md", report)
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    write_manifest_markdown(output / "manifest.md", manifest)
 
-    issues = report["issues"]
-    print(f"\nReport: {output / 'report.md'}")
-    print(
-        f"Issues: console={issues['console_errors']} page={issues['page_errors']} "
-        f"overflow={issues['overflow']} low-brand={issues['low_brand']}"
-    )
-    return 1 if args.strict and any(issues.values()) else 0
+    print(f"\nManifest: {output / 'manifest.md'}")
+    print(f"Downloaded: {manifest['files_downloaded']} PNGs · Failed: {manifest['failures']}")
+    return 1 if failures else 0
 
 
-def write_markdown(path: Path, report: dict) -> None:
+def write_manifest_markdown(path: Path, manifest: dict) -> None:
     lines = [
-        "# Image download report",
+        "# Screenshot download manifest",
         "",
-        f"Generated: {report['generated_at']} · Mode: {report['mode']} · Base: {report['base_url']}",
+        f"Generated: {manifest['generated_at']} · Base: {manifest['base_url']}",
         "",
-        "| Route | Viewport | Status | Overflow | Brand ratio | Flags |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Route | Viewport | Status | File |",
+        "| --- | --- | --- | --- |",
     ]
-    for c in report["captures"]:
-        flags = []
-        if c["console_errors"]:
-            flags.append("console")
-        if c["page_errors"]:
-            flags.append("pageerror")
-        if c["overflow_px"]:
-            flags.append("overflow")
-        if c["low_brand"]:
-            flags.append("low-brand")
-        ratio = "skip" if report["mode"] == "download" else f"{c['brand_ratio']:.3f}"
-        lines.append(
-            f"| `{c['route']}` | {c['viewport']} | {c['status']} | {c['overflow_px']} | "
-            f"{ratio} | {', '.join(flags) or 'ok'} |"
-        )
-    if report["routes_skipped"]:
+    for c in manifest["captures"]:
+        file = f"`{c['screenshot']}`" if c["screenshot"] else "—"
+        status = c["error"] or str(c["status"])
+        lines.append(f"| `{c['route']}` | {c['viewport']} | {status} | {file} |")
+    if manifest["routes_skipped"]:
         lines += ["", "## Skipped routes", ""]
-        lines += [f"- `{s['uri']}` — {s['reason']}" for s in report["routes_skipped"]]
+        lines += [f"- `{s['uri']}` — {s['reason']}" for s in manifest["routes_skipped"]]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
